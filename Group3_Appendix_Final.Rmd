@@ -1,0 +1,528 @@
+---
+title: "Appendix: R Code - Group 3 Final Project"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval=FALSE)
+
+# load requisite packages
+library(dplyr)
+library(haven)
+library(ordinal)
+library(tidyr)
+library(kableExtra)
+library(magick)
+library(ggplot2)
+
+def.par <- par(no.readonly = TRUE)
+```
+
+# DATA PREP
+```{r UK survey data}
+# Load interviewer data
+ESS5INT<-read_por("ESS5INTe03sas.por")
+
+# Subset Great Britain (GB) data and select interviewer ID (INTNUM), gender (INTGNDR), age (INTAGEA), and R's ID (IDNO) 
+UKint <- ESS5INT %>% 
+  mutate(intid=as.numeric(ESS5INT$INTNUM), 
+    gender=factor(ESS5INT$INTGNDR), 
+    age=as.numeric(INTAGEA), 
+    respondent=as.character(ESS5INT$IDNO)) %>%
+  subset(CNTRY=="GB") %>% 
+  select(intid, gender, age, respondent)
+
+# Read in survey data
+ESS5<-read_sas("ess5e03_4.sas7bdat")
+
+# reformat IDs
+ESS5$idno<-as.numeric(ESS5$idno) # convert respondent IDs to numeric in respondent data
+UKint$respondent<-as.numeric(UKint$respondent) # convert respondent IDs to numeric in interviewer data
+
+# Join interviewer characteristics, respondent characteristics, the four outcomes of interest, and weights.
+UK_data <- UKint %>%
+  left_join(ESS5, by = c("respondent" = "idno")) %>%
+  select(intid, gender, age, region, respondent, happy, freehms, tvtot, pray, gndr, agea, domicil, pspwght)
+
+# recode missing data
+UK_data$age[UK_data$age==999]<-NA # NA interviewer with age coded as 999
+UK_data$agea[UK_data$agea==999]<-NA # NA respondents with agea coded as 999
+UK_data$gndr[UK_data$gndr==9]<-NA # NA for respondent with gndr coded as 9
+UK_data$happy[UK_data$happy==77]<-NA # convert 1 refusal to NA
+UK_data$happy[UK_data$happy==88]<-NA # convert 3 don't know's to NA
+UK_data$freehms[UK_data$freehms==8]<-NA # convert 37 don't know's to NA
+UK_data$tvtot[UK_data$tvtot==88]<-NA # convert 4 don't know's to NA
+UK_data$pray[UK_data$pray==88]<-NA # convert 15 don't know's to NA
+UK_data$pray[UK_data$pray==77]<-NA # convert 3 refusals to NA
+UK_data$domicil[UK_data$domicil==8]<-NA # convert 9 no answer to NA
+
+# Mutate UK data for modeling
+UK_data<-UK_data %>%
+  mutate(intid = intid,
+    intgndr = factor(ifelse(gender==1, 0, 1), levels = c(0,1), labels = c("Male", "Female")),
+    intage = age,
+    intagec = age-55.76587,
+    rid = respondent,
+    region = factor(ifelse(region=="UKC", "01.NE-England", 
+       ifelse(region=="UKD", "02.NW-England",
+         ifelse(region=="UKE", "03.Yorkshire",
+           ifelse(region=="UKF", "04.East Midlands",
+             ifelse(region=="UKG", "05.West Midlands",
+          ifelse(region=="UKH", "06.East of England",
+            ifelse(region=="UKI", "07.London",
+              ifelse(region=="UKJ", "08.SE-England",
+                ifelse(region=="UKK", "09.SW-England",
+                  ifelse(region=="UKL", "10.Wales", 
+                    ifelse(region=="UKM", "11.Scotland", "12.NorthernIE")))))))))))),
+    domicil = factor(ifelse(domicil<3, 1, ifelse(domicil==3, 2, 3)), levels = c(1:3), labels = c("HighPop", "MedPop", "LowPop")),
+    rgndr = factor(ifelse(gndr==1, 0, 1), levels = c(0,1), labels = c("Male", "Female")),
+    rage = agea,
+    ragec = agea-49.83394,
+    happy = factor(ifelse(happy<5, -1, ifelse(happy>5, 1, 0)), levels = c(-1, 0, 1), labels = c("Unhappy", "Neutral", "Happy"), ordered=TRUE),
+    freehms = factor(freehms, levels=c(1,2,3,4,5), labels = c("Agree Strongly", "Agree", "Neutral", "Disagree", "Disagree Strongly"),ordered=TRUE), 
+    tvtot = factor(tvtot, levels=c(0,1,2,3,4,5,6,7), labels = c("0 min", "<30 min", "30-60 min", "61-90 min", "91-120 min", "121-150 min", "151-180 min", ">180 min"), ordered=TRUE),
+    pray = factor(pray, levels = c(1:7), labels = c("Daily", ">1 Weekly", "Weekly", ">=1 Monthly", "Holy Days", "Less Often", "Never"), ordered = TRUE),
+    pspwght = pspwght, .keep = "none")
+
+# subset case.complete data to interviewers who fully completed five or more interviews & add total interviews
+UKfiveplus<-UK_data[complete.cases(UK_data),] %>%
+  group_by(intid) %>%
+  filter(n()>4) %>%
+  mutate(totalints = n_distinct(rid))
+
+# clean up environment
+rm(list = c("ESS5", "ESS5INT", "UKint"))
+
+save(UK_data, file="UK_withNA_data_final.RData")
+save(UKfiveplus, file="UK_clean_data_final.RData")
+```
+
+# DATA SUMMARIES
+## Interview Summary
+```{r}
+# number of unique interviewers
+n_distinct(UKfiveplus$intid)
+
+# mean number of interviews per interviewer
+round(mean(UKfiveplus$totalints[!duplicated(UKfiveplus$intid)]), 2)
+
+# 14 interviewers with more than one region.
+UKfiveplus %>%
+  group_by(intid) %>%
+  summarise(multirgn = sum(n_distinct(region)>1)) 
+
+# Interviews by interviewer.
+IntsByInt<-UKfiveplus %>%
+  group_by(intid) %>%
+  summarise(TotalInts = sum(n_distinct(rid)),
+            Male.Int = n_distinct(intid[intgndr=="Male"]),
+            Female.Int = n_distinct(intid[intgndr=="Female"]))
+
+round((sum(IntsByInt$Male.Int)/158)*100, 2)
+round((sum(IntsByInt$Female.Int)/158)*100, 2)
+
+summary(UKfiveplus$rage)
+
+# INTERVIEWS BY DOMICIL BY REGIONS
+UKfiveplus %>%
+  group_by(region, domicil) %>%
+  summarise(numinterviews = n_distinct(rid)) 
+
+# summarise interviewers and interviewees by gender and region (Table 2)
+Table1<-UKfiveplus %>%
+  group_by(region) %>%
+  summarise(N.Interviews = n_distinct(rid),
+            PrcLDensity = round(sum(domicil=="LowPop")/n_distinct(rid)*100, 2),
+            PrcMDensity = round(sum(domicil=="MedPop")/n_distinct(rid)*100, 2),
+            PrcHDensity = round(sum(domicil=="HighPop")/n_distinct(rid)*100, 2),
+            Male.Int = n_distinct(intid[intgndr=="Male"]),
+            Female.Int = n_distinct(intid[intgndr=="Female"]),
+            AvgAge.Int = round(mean(intage[!duplicated(UKfiveplus$intid)], na.rm = TRUE), 0),
+            Male.R = sum(rgndr=="Male"),
+            Female.R = sum(rgndr=="Female"),
+            AvgAge.R = round(mean(rage))) 
+
+tableNames<- c("Region", "Total <br/>Interviews", "% Low", "% Med", "% High", "Males", "Females", "Mean Age", "Males", "Females", "Mean Age" )
+
+kable(Table1, 
+      caption = "Table 1: Summary by Region", 
+      booktabs = T,
+      "html", 
+      col.names = tableNames, # "tableNames" object created with list of names above <br/> works with "escape = FALSE" to create new line in text.
+      align='lcccccccccc', # 1 character per column in table; i.e., 1 "l" for left and 10 "c" for center
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped")) %>%
+  add_header_above(c(" " = 2, "Population Density" = 3, "Interviewers" = 3, "Respondents" = 3)) %>% # integer indicates number of columns to be covered by 2nd level header
+  save_kable("Table1.jpg")
+
+```
+
+
+
+## happy
+```{r}
+# Table of happy responses
+table(UKfiveplus$happy, useNA = 'always')
+
+# Histogram of happy responses
+hist(as.numeric(UKfiveplus$happy), 
+     main="Taking all things together, how happy would you say you are?", 
+     xlab="Categories: 1-3 \nUnhappy - Neutral - Happy",
+     ylim = c(0, 2000),
+     breaks = c(0:3),
+     include.lowest = T,
+     xaxt="n"); axis(side=1, at=c(0, 1, 2, 3))
+
+# table of freehms responses
+table(UKfiveplus$region, UKfiveplus$happy)
+
+# plot responses across regions
+crosstabhappy<-as.data.frame(table(UKfiveplus$region, UKfiveplus$happy))
+colnames(crosstabhappy)<-c("region", "category", "frequency")
+ggplot(crosstabhappy, aes(x = region, y = frequency, fill = category, label = frequency)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle=60, hjust = 1)) +
+  ggtitle("Taking all things together, how happy would you say you are?") +
+  labs(x="Region", y="Response Frequency") +
+  scale_fill_brewer(palette = "RdBu", name = "Response \nOptions")
+
+# Box plots for happy by interviewer IDs
+# par(mfrow=c(2,2))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid < 2690,]$happy) ~ factor(UKfiveplus[UKfiveplus$intid < 2690,]$intid))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$happy) ~ factor(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$happy) ~ factor(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 14388,]$happy) ~ factor(UKfiveplus[UKfiveplus$intid >= 14388,]$intid)) 
+```
+
+## freehms
+```{r}
+# Table of freehms responses
+table(UKfiveplus$freehms, useNA = 'always')
+
+# Histogram of freehms responses
+hist(as.numeric(UKfiveplus$freehms),
+     main="Gay men and lesbians should be free to live their own life as they wish. \nTo what extent do you agree?", 
+     xlab="Categories: 1-5 \nAgree Strongly - Agree - Neutral - Disagree - Dissagree Strongly", 
+     breaks = c(0:5), 
+     include.lowest = T,
+     cex.axis=0.9) 
+
+# table of freehms responses
+table(UKfiveplus$region, UKfiveplus$freehms)
+
+# plot responses across regions
+crosstabfreehms<-as.data.frame(table(UKfiveplus$region, UKfiveplus$freehms))
+colnames(crosstabfreehms)<-c("region", "category", "frequency")
+ggplot(crosstabfreehms, aes(x = region, y = frequency, fill = category, label = frequency)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle=60, hjust = 1)) +
+  ggtitle("Gay men and lesbians should be free to live their own life as they wish. \nTo what extent do you agree?") +
+  labs(x="Region", y="Response Frequency") +
+  scale_fill_brewer(palette = "RdBu", name = "Response \nOptions")
+
+# box plots for freehms by interviewer ID-
+# par(mfrow=c(2,2))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid < 2690,]$freehms) ~ factor(UKfiveplus[UKfiveplus$intid < 2690,]$intid))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$freehms) ~ factor(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$freehms) ~ factor(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 14388,]$freehms) ~ factor(UKfiveplus[UKfiveplus$intid >= 14388,]$intid)) 
+```
+
+## tvtot
+```{r}
+# Table of tvtot responses
+table(UKfiveplus$tvtot, useNA = 'always')
+
+# Histogram of tvtot responses
+hist(as.numeric(UKfiveplus$tvtot),
+     main="On an average weekday, how much time do you spend watching TV?", 
+     xlab="Categories: 1-8 \n 0.0 hrs. - 3.0+ hrs (in 0.5 hr increments)", 
+     breaks = c(0:8), 
+     include.lowest = T,
+     xaxt="n"); axis(side=1, at=c(0,1,2,3,4,5,6,7,8))
+
+# table of freehms responses
+table(UKfiveplus$region, UKfiveplus$tvtot)
+
+# plot responses across regions
+crosstabtvtot<-as.data.frame(table(UKfiveplus$region, UKfiveplus$tvtot))
+colnames(crosstabtvtot)<-c("region", "category", "frequency")
+ggplot(crosstabtvtot, aes(x = region, y = frequency, fill = category, label = frequency)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle=60, hjust = 1)) +
+  ggtitle("On an average weekday, how much time do you spend watching television?") +
+  labs(x="Region", y="Response Frequency") +
+  scale_fill_brewer(palette = "RdBu", name = "Response \nOptions")
+
+# Box plots for tvtot by interviewer IDs
+# par(mfrow=c(2,2))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid < 2690,]$tvtot) ~ factor(UKfiveplus[UKfiveplus$intid < 2690,]$intid))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$tvtot) ~ factor(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$tvtot) ~ factor(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 14388,]$tvtot) ~ factor(UKfiveplus[UKfiveplus$intid >= 14388,]$intid))
+```
+
+## pray
+```{r}
+# Table of pray responses
+table(UKfiveplus$pray, useNA = 'always') 
+
+# Histogram of pray responses
+hist(as.numeric(UKfiveplus$pray), 
+     main="Apart from when you are at religious services, how often do you pray?", 
+     xlab="Categories: 1-7 \nDaily - More than Weekly - Weekly - At Least Monthly - Holy Days - Less Often - Never",
+     breaks = c(0:7), 
+     ylim = c(0, 1200),
+     include.lowest = T,
+     cex.axis=0.9) 
+
+# table of freehms responses
+table(UKfiveplus$region, UKfiveplus$pray)
+
+# plot responses across regions
+crosstabpray<-as.data.frame(table(UKfiveplus$region, UKfiveplus$pray))
+colnames(crosstabpray)<-c("region", "category", "frequency")
+ggplot(crosstabpray, aes(x = region, y = frequency, fill = category, label = frequency)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle=60, hjust = 1)) +
+  ggtitle("Apart from when you are at religious services, how often, if at all, do you pray?") +
+  labs(x="Region", y="Response Frequency") +
+  scale_fill_brewer(palette = "RdBu", name = "Response \nOptions")
+
+# Box plots for pray by interviewer IDs
+# par(mfrow=c(2,2))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid < 2690,]$pray) ~ factor(UKfiveplus[UKfiveplus$intid < 2690,]$intid))
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$pray) ~ factor(UKfiveplus[UKfiveplus$intid >= 2690 & UKfiveplus$intid < 9007,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$pray) ~ factor(UKfiveplus[UKfiveplus$intid >= 9007 & UKfiveplus$intid < 14388,]$intid)) 
+# plot(as.numeric(UKfiveplus[UKfiveplus$intid >= 14388,]$pray) ~ factor(UKfiveplus[UKfiveplus$intid >= 14388,]$intid))
+# 
+# par(def.par)
+```
+
+# HAPPY
+## happy1 ~ ragec + as.factor(rgndr) + as.factor(domicil) + as.factor(region) + intagec + intgndr + (1 | intid)
+```{r happy1}
+# Fixed Effects only model to test against random intercept model
+noint_happy1 <- clm(happy ~ ragec + rgndr + domicil + region + intagec + intgndr,
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model
+clmm_happy1 <- clmm(happy ~ ragec + rgndr + domicil + region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model with interaction effect
+clmm_happy2 <- clmm(happy ~ ragec + rgndr + domicil*region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus); 
+
+
+summary(noint_happy1) # fixed effect only model
+summary(clmm_happy1) # random intercept model
+summary(clmm_happy2) # random intercept model with interaction
+
+anova(noint_happy1,clmm_happy1) # test RI against no RI
+anova(clmm_happy1,clmm_happy2) # test RI w/o Interaction against RI w/ interaction
+
+BIC(noint_happy1); BIC(clmm_happy1); BIC(clmm_happy2)  # check BIC of RI model to FE model
+
+# The ranef function extracts the conditional modes of the random effects from a clmm object. 
+# ranef(clmm_happy1)
+
+# Plot EBLUPS
+# qqnorm(ranef(clmm_happy1)$intid[,1])
+# qqline(ranef(clmm_happy1)$intid[,1])
+
+# Sort and plot interviewer effects with 95% CI
+ci1 <- clmm_happy1$ranef + qnorm(0.975) * sqrt(clmm_happy1$condVar) %o% c(-1, 1)
+ord.re1 <- order(clmm_happy1$ranef)
+ci1 <- ci1[order(clmm_happy1$ranef),]
+
+colors1<-ifelse(ci1[,2]<0, "Red", ifelse(ci1[,1]>0, "Red", "Black"))
+
+plot(clmm_happy1$ranef[ord.re1], axes=FALSE, ylim=range(ci1),
+     main = "EBLUP of Interviewer Effect with 95% CI \nTaking all things together, how happy would you say you are?",
+     xlab="Interviewer ID (ordered by effect size)", 
+     ylab="Interviewer Effect",
+     col = colors1); axis(1, at=1:158, labels = ord.re1); axis(2); for(i in 1:158) segments(i, ci1[i,1], i, ci1[i, 2], col = colors1[i]); abline(h = 0, lty=2)
+```
+
+
+# FREEHMS
+## freehms1 ~ ragec + as.factor(rgndr) + as.factor(domicil) + as.factor(region) + intagec + intgndr + (1 | intid)
+```{r freehms1}
+# Fixed Effects only model to test against random intercept model
+noint_freehms1 <- clm(freehms ~ ragec + rgndr + domicil + region + intagec + intgndr,
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model
+clmm_freehms1 <- clmm(freehms ~ ragec + rgndr + domicil + region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model with interaction effect
+clmm_freehms2 <- clmm(freehms ~ ragec + rgndr + domicil*region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus); 
+
+
+summary(noint_freehms1) # fixed effect only model
+summary(clmm_freehms1) # random intercept model
+summary(clmm_freehms2) # random intercept model with interaction
+
+anova(noint_freehms1,clmm_freehms1) # test RI against no RI
+anova(clmm_freehms1,clmm_freehms2) # test RI w/o Interaction against RI w/ interaction
+
+BIC(noint_freehms1); BIC(clmm_freehms1); BIC(clmm_freehms2)  # check BIC of RI model to FE model
+
+# The ranef function extracts the conditional modes of the random effects from a clmm object. 
+# ranef(clmm_freehms1)
+
+# Plot EBLUPS
+# qqnorm(ranef(clmm_freehms1)$intid[,1])
+# qqline(ranef(clmm_freehms1)$intid[,1])
+
+# Sort and plot interviewer effects with 95% CI
+ci2 <- clmm_freehms1$ranef + qnorm(0.975) * sqrt(clmm_freehms1$condVar) %o% c(-1, 1)
+ord.re2 <- order(clmm_freehms1$ranef)
+ci2 <- ci2[order(clmm_freehms1$ranef),]
+
+colors2<-ifelse(ci2[,2]<0, "Red", ifelse(ci2[,1]>0, "Red", "Black"))
+
+plot(clmm_freehms1$ranef[ord.re2], axes=FALSE, ylim=range(ci2),
+     main = "EBLUP of Interviewer Effect with 95% CI \nGay men and lesbians should be free \nto live their own life as they wish. \nTo what extent do you agree?",
+     xlab="Interviewer ID (ordered by effect size)", 
+     ylab="Interviewer Effect",
+     col = colors2); axis(1, at=1:158, labels = ord.re2); axis(2); for(i in 1:158) segments(i, ci2[i,1], i, ci2[i, 2], col = colors2[i]); abline(h = 0, lty=2)
+```
+
+# TVTOT
+## tvtot1 ~ ragec + as.factor(rgndr) + as.factor(domicil) + as.factor(region) + intagec + intgndr + (1 | intid)
+```{r}
+# Fixed Effects only model to test against random intercept model
+noint_tvtot1 <- clm(tvtot ~ ragec + rgndr + domicil + region + intagec + intgndr,
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model
+clmm_tvtot1 <- clmm(tvtot ~ ragec + rgndr + domicil + region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model with interaction effect
+clmm_tvtot2 <- clmm(tvtot ~ ragec + rgndr + domicil*region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus); 
+
+
+summary(noint_tvtot1) # fixed effect only model
+summary(clmm_tvtot1) # random intercept model
+summary(clmm_tvtot2) # random intercept model with interaction
+
+anova(noint_tvtot1,clmm_tvtot1) # test RI against no RI
+anova(clmm_tvtot1,clmm_tvtot2) # test RI w/o Interaction against RI w/ interaction
+
+BIC(noint_tvtot1); BIC(clmm_tvtot1); BIC(clmm_tvtot2)  # check BIC of RI model to FE model
+
+# The ranef function extracts the conditional modes of the random effects from a clmm object. 
+# ranef(clmm_tvtot1)
+
+# Plot EBLUPS
+# qqnorm(ranef(clmm_tvtot1)$intid[,1])
+# qqline(ranef(clmm_tvtot1)$intid[,1])
+
+# Sort and plot interviewer effects with 95% CI
+ci3 <- clmm_tvtot1$ranef + qnorm(0.975) * sqrt(clmm_tvtot1$condVar) %o% c(-1, 1)
+ord.re3 <- order(clmm_tvtot1$ranef)
+ci3 <- ci3[order(clmm_tvtot1$ranef),]
+
+colors3<-ifelse(ci3[,2]<0, "Red", ifelse(ci3[,1]>0, "Red", "Black"))
+
+plot(clmm_tvtot1$ranef[ord.re3], axes=FALSE, ylim=range(ci3),
+     main = "EBLUP of Interviewer Effect with 95% CI \nHow much time do you spend watching television?",
+     xlab="Interviewer ID (ordered by effect size)", 
+     ylab="Interviewer Effect",
+     col = colors3); axis(1, at=1:158, labels = ord.re3); axis(2); for(i in 1:158) segments(i, ci3[i,1], i, ci3[i, 2], col = colors3[i]); abline(h = 0, lty=2)
+```
+
+# PRAY
+## pray1 ~ ragec + as.factor(rgndr) + as.factor(domicil) + as.factor(region) + intagec + intgndr + (1 | intid)
+```{r pray1}
+# Fixed Effects only model to test against random intercept model
+noint_pray1 <- clm(pray ~ ragec + rgndr + domicil + region + intagec + intgndr,
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model
+clmm_pray1 <- clmm(pray ~ ragec + rgndr + domicil + region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus)
+
+# Random Intercept & Fixed Effects model with interaction effect
+clmm_pray2 <- clmm(pray ~ ragec + rgndr + domicil*region + intagec + intgndr + (1 | intid),
+       weights = pspwght,
+       Hess = TRUE,
+       na.action = "na.omit",
+       data = UKfiveplus); 
+
+
+summary(noint_pray1) # fixed effect only model
+summary(clmm_pray1) # random intercept model
+summary(clmm_pray2) # random intercept model with interaction
+
+anova(noint_pray1,clmm_pray1) # test RI against no RI
+anova(clmm_pray1,clmm_pray2) # test RI w/o Interaction against RI w/ interaction
+
+BIC(noint_pray1); BIC(clmm_pray1); BIC(clmm_pray2)  # check BIC of RI model to FE model
+
+# The ranef function extracts the conditional modes of the random effects from a clmm object. 
+# ranef(clmm_pray1)
+
+# Plot EBLUPS
+# qqnorm(ranef(clmm_pray1)$intid[,1])
+# qqline(ranef(clmm_pray1)$intid[,1])
+
+# Sort and plot interviewer effects with 95% CI
+ci4 <- clmm_pray1$ranef + qnorm(0.975) * sqrt(clmm_pray1$condVar) %o% c(-1, 1)
+ord.re4 <- order(clmm_pray1$ranef)
+ci4 <- ci4[order(clmm_pray1$ranef),]
+
+colors4<-ifelse(ci4[,2]<0, "Red", ifelse(ci4[,1]>0, "Red", "Black"))
+
+plot(clmm_pray1$ranef[ord.re4], axes=FALSE, ylim=range(ci4),
+     main = "EBLUP of Interviewer Effect with 95% CI \nHow often do you pray?",
+     xlab="Interviewer ID (ordered by effect size)", 
+     ylab="Interviewer Effect",
+     col = colors4); axis(1, at=1:158, labels = ord.re4); axis(2); for(i in 1:158) segments(i, ci4[i,1], i, ci4[i, 2], col = colors4[i]); abline(h = 0, lty=2)
+```
+
+# ICC Calculations
+```{r}
+ICC_df<-data.frame(IntVariance = c(0.3409, 0.4062, 0.3266, 0.2575), ResidVariance = c(3.289869,3.289869,3.289869,3.289869))
+ICC_df$ICC<-ICC_df$IntVariance/(ICC_df$IntVariance+ICC_df$ResidVariance)
+ICC_df$ICC
+```
